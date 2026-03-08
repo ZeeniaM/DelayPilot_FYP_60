@@ -446,14 +446,14 @@ def get_flights(date: str = None):
                 s.eta_utc,
                 s.ata_utc,
                 s.confirmed_delay_min,
-                -- ML model predictions from flight_predictions table
-                p.minutes_ui        AS ml_minutes_ui,
-                p.p_delay_15        AS ml_p_delay_15,
-                p.p_delay_30        AS ml_p_delay_30,
-                p.pred_delay_15     AS ml_pred_delay_15,
-                p.pred_delay_30     AS ml_pred_delay_30,
-                p.ml_cause          AS ml_cause,
-                p.cause_scores      AS cause_scores
+                -- ML batch predictions (from flight_predictions, populated by run_batch_predictions.py)
+                p.minutes_ui            AS ml_minutes_ui,
+                p.p_delay_15            AS ml_p_delay_15,
+                p.p_delay_30            AS ml_p_delay_30,
+                p.pred_delay_15         AS ml_pred_delay_15,
+                p.pred_delay_30         AS ml_pred_delay_30,
+                p.ml_cause              AS ml_cause,
+                p.cause_scores          AS cause_scores
             FROM featured_muc_rxn_wx3_fe f
             LEFT JOIN flights_raw r
                    ON r.number_raw = f.number_raw
@@ -495,14 +495,14 @@ def get_flights(date: str = None):
                 "eta_utc":               str(r[14])  if r[14] is not None else None,
                 "ata_utc":               str(r[15])  if r[15] is not None else None,
                 "confirmed_delay_min":   float(r[16]) if r[16] is not None else None,
-                # ML model predictions from flight_predictions table
+                # ML batch predictions
                 "ml_minutes_ui":         float(r[17]) if r[17] is not None else None,
                 "ml_p_delay_15":         float(r[18]) if r[18] is not None else None,
                 "ml_p_delay_30":         float(r[19]) if r[19] is not None else None,
-                "ml_pred_delay_15":      bool(r[20])  if r[20] is not None else None,
-                "ml_pred_delay_30":      bool(r[21])  if r[21] is not None else None,
-                "ml_cause":              r[22],
-                "cause_scores":          r[23],   # JSON string {"Weather (MUC)": 45, ...}
+                "ml_pred_delay_15":      int(r[20])   if r[20] is not None else None,
+                "ml_pred_delay_30":      int(r[21])   if r[21] is not None else None,
+                "ml_cause":              str(r[22])   if r[22] is not None else None,
+                "cause_scores":          str(r[23])   if r[23] is not None else None,
             }
             for r in rows
         ]
@@ -734,29 +734,56 @@ def simulate_flight(req: SimulateRequest):
 
 @app.get("/weather/current")
 def current_weather():
-    """Returns latest weather for MUC (EDDM) from weather_hourly table."""
+    """
+    Returns latest weather for all 3 airports: EDDM (MUC), EDDF (FRA), EGLL (LHR).
+    MUC full detail; FRA and LHR summary. Extra MUC fields: wind_gusts, snowfall, cloud_cover, humidity.
+    """
     try:
-        q = """
-            SELECT hour_utc, temperature_2m, wind_speed_10m,
-                   precipitation, visibility, weather_code
+        q = text("""
+            SELECT
+                airport_icao, hour_utc, temperature_2m, wind_speed_10m, wind_gusts_10m,
+                precipitation, snowfall, visibility, weather_code, cloud_cover, relative_humidity_2m
             FROM weather_hourly
-            WHERE airport_icao = 'EDDM'
-            ORDER BY hour_utc DESC
-            LIMIT 1
-        """
+            WHERE airport_icao IN ('EDDM', 'EDDF', 'EGLL')
+              AND (airport_icao, hour_utc) IN (
+                  SELECT airport_icao, MAX(hour_utc)
+                  FROM weather_hourly
+                  WHERE airport_icao IN ('EDDM', 'EDDF', 'EGLL')
+                  GROUP BY airport_icao
+              )
+            ORDER BY airport_icao
+        """)
         with engine.connect() as conn:
-            row = conn.execute(text(q)).fetchone()
+            rows = conn.execute(q).fetchall()
 
-        if not row:
+        if not rows:
             raise HTTPException(status_code=404, detail="No weather data")
 
+        airports = {}
+        for row in rows:
+            airports[row[0]] = {
+                "timestamp": str(row[1]), "temperature": row[2], "wind_speed": row[3],
+                "wind_gusts": row[4], "precipitation": row[5], "snowfall": row[6],
+                "visibility": row[7], "weather_code": row[8],
+                "cloud_cover": row[9], "relative_humidity": row[10],
+            }
+
+        muc = airports.get("EDDM", {})
+        fra = airports.get("EDDF", {})
+        lhr = airports.get("EGLL", {})
+
         return {
-            "timestamp": str(row[0]),
-            "temperature": row[1],
-            "wind_speed": row[2],
-            "precipitation": row[3],
-            "visibility": row[4],
-            "weather_code": row[5],
+            "timestamp": muc.get("timestamp"), "temperature": muc.get("temperature"),
+            "wind_speed": muc.get("wind_speed"), "wind_gusts": muc.get("wind_gusts"),
+            "precipitation": muc.get("precipitation"), "snowfall": muc.get("snowfall"),
+            "visibility": muc.get("visibility"), "weather_code": muc.get("weather_code"),
+            "cloud_cover": muc.get("cloud_cover"), "relative_humidity": muc.get("relative_humidity"),
+            "fra": {"temperature": fra.get("temperature"), "wind_speed": fra.get("wind_speed"),
+                    "precipitation": fra.get("precipitation"), "weather_code": fra.get("weather_code"),
+                    "visibility": fra.get("visibility")},
+            "lhr": {"temperature": lhr.get("temperature"), "wind_speed": lhr.get("wind_speed"),
+                    "precipitation": lhr.get("precipitation"), "weather_code": lhr.get("weather_code"),
+                    "visibility": lhr.get("visibility")},
         }
     except HTTPException:
         raise
