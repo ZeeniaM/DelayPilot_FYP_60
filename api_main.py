@@ -792,6 +792,126 @@ def current_weather():
         raise HTTPException(status_code=500, detail="Failed to fetch weather")
 
 
+
+@app.get("/flights/analytics")
+def get_delay_trends(date: str = None):
+    """
+    Returns aggregated delay trend + cause breakdown from flight_delay_snapshots.
+
+    This table accumulates across refresh cycles (upsert, not replace), so the
+    charts improve in accuracy over time as more Status API and ML data comes in.
+
+    Query params:
+      date: YYYY-MM-DD  (defaults to today UTC)
+
+    Returns:
+      trend  — list of {hour, total, delayed, delay_rate} for each UTC hour
+      causes — list of {name, value} for cause breakdown (ML cause preferred,
+               falls back to weather-code heuristic)
+      meta   — {total_flights, delayed_flights, date, last_updated}
+    """
+    try:
+        from datetime import date as dt_date
+        target_date = date or dt_date.today().isoformat()
+
+        with engine.connect() as conn:
+            # Check table exists
+            exists = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'flight_delay_snapshots'
+                )
+            """)).scalar()
+
+        if not exists:
+            return {"trend": [], "causes": [], "meta": {"error": "Snapshot table not yet created. Run one refresh cycle first."}}
+
+        with engine.connect() as conn:
+            # ── Hourly trend ─────────────────────────────────────────────────
+            trend_rows = conn.execute(text("""
+                SELECT
+                    EXTRACT(HOUR FROM sched_utc AT TIME ZONE 'Europe/Berlin')::INT AS hour,
+                    COUNT(*)                                              AS total,
+                    COUNT(*) FILTER (
+                        WHERE delay_status IN ('Minor Delay', 'Major Delay')
+                    )                                                     AS delayed
+                FROM flight_delay_snapshots
+                WHERE flight_date = :date
+                GROUP BY 1
+                ORDER BY 1
+            """), {"date": target_date}).fetchall()
+
+            # ── Cause breakdown ───────────────────────────────────────────────
+            # Priority: use ml_cause when available, else derive from weather/delay
+            cause_rows = conn.execute(text("""
+                SELECT
+                    COALESCE(
+                        NULLIF(ml_cause, ''),
+                        CASE
+                            WHEN wx_weather_code > 50 OR wx_precipitation > 0 THEN 'Weather'
+                            WHEN resolved_delay_min >= 30                      THEN 'Reactionary'
+                            WHEN resolved_delay_min >= 5                       THEN 'Congestion'
+                            ELSE NULL
+                        END
+                    ) AS cause,
+                    COUNT(*) AS cnt
+                FROM flight_delay_snapshots
+                WHERE flight_date = :date
+                  AND delay_status IN ('Minor Delay', 'Major Delay')
+                  AND resolved_delay_min IS NOT NULL
+                GROUP BY 1
+                ORDER BY 2 DESC
+            """), {"date": target_date}).fetchall()
+
+            # ── Meta ──────────────────────────────────────────────────────────
+            meta_row = conn.execute(text("""
+                SELECT
+                    COUNT(*)                                              AS total,
+                    COUNT(*) FILTER (
+                        WHERE delay_status IN ('Minor Delay', 'Major Delay')
+                    )                                                     AS delayed,
+                    MAX(last_updated_utc)                                 AS last_updated
+                FROM flight_delay_snapshots
+                WHERE flight_date = :date
+            """), {"date": target_date}).fetchone()
+
+        # Build full 24-hour trend (fill missing hours with 0)
+        trend_map = {r[0]: {"total": r[1], "delayed": r[2]} for r in trend_rows}
+        trend = []
+        for h in range(24):
+            bucket = trend_map.get(h, {"total": 0, "delayed": 0})
+            total   = int(bucket["total"])
+            delayed = int(bucket["delayed"])
+            trend.append({
+                "hour":        f"{str(h).zfill(2)}:00",
+                "total":       total,
+                "delayed":     delayed,
+                "delay_rate":  round(delayed / total * 100, 1) if total > 0 else 0,
+            })
+
+        causes = [
+            {"name": row[0] or "Other", "value": int(row[1])}
+            for row in cause_rows
+            if row[0] is not None
+        ]
+        if not causes:
+            causes = [{"name": "No delay data", "value": 1}]
+
+        return {
+            "trend":  trend,
+            "causes": causes,
+            "meta": {
+                "total_flights":   int(meta_row[0]) if meta_row else 0,
+                "delayed_flights": int(meta_row[1]) if meta_row else 0,
+                "date":            target_date,
+                "last_updated":    str(meta_row[2]) if meta_row and meta_row[2] else None,
+            },
+        }
+
+    except Exception as e:
+        logger.error("/flights/analytics error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 # For running with: python api_main.py (useful in dev)
 if __name__ == "__main__":
     import uvicorn

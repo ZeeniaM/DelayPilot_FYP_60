@@ -164,12 +164,24 @@ class V3FinalModelService:
             p30 = float(self.bin30.predict_proba(X_cb)[:, 1][0])
 
             # Raw minutes from regressor
-            minutes_pred = float(self.reg2.predict(X_cb)[0])
+            minutes_pred_raw = self.reg2.predict(X_cb)[0]
+            # Guard: CatBoost can return NaN for edge-case feature combinations.
+            # numpy NaN cannot be passed to int() — replace with 0.0 (on-time fallback).
+            import math
+            minutes_pred = float(minutes_pred_raw) if not math.isnan(float(minutes_pred_raw)) else 0.0
 
-            # Thresholds from metadata (fallbacks from notebook if missing)
-            thr15 = float(self.thresholds.get("bin15_best_valid", 0.3))
-            thr30 = float(self.thresholds.get("bin30_best_valid", 0.4))
-            reg_train_min = int(self.thresholds.get("reg_train_delay_min", 5))
+            # Probabilities: also guard against NaN from classifier edge cases
+            if math.isnan(p15): p15 = 0.0
+            if math.isnan(p30): p30 = 0.0
+
+            # Thresholds from metadata — guard against NaN stored in JSON
+            thr15_raw = self.thresholds.get("bin15_best_valid", 0.3)
+            thr30_raw = self.thresholds.get("bin30_best_valid", 0.4)
+            reg_min_raw = self.thresholds.get("reg_train_delay_min", 5)
+
+            thr15 = float(thr15_raw) if thr15_raw is not None and not math.isnan(float(thr15_raw)) else 0.3
+            thr30 = float(thr30_raw) if thr30_raw is not None and not math.isnan(float(thr30_raw)) else 0.4
+            reg_train_min = int(float(reg_min_raw)) if reg_min_raw is not None and not math.isnan(float(reg_min_raw)) else 5
 
             # Binary labels
             pred15 = int(p15 >= thr15)
@@ -205,4 +217,3 @@ class V3FinalModelService:
 
 
 __all__ = ["V3FinalModelService"]
-

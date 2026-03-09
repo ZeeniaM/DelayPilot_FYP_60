@@ -75,24 +75,53 @@ def fetch_flight_status(flight_no_clean: str, date_local: str) -> Optional[Dict[
         "X-RapidAPI-Key":  RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST,
     }
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        if resp.status_code == 404:
-            logger.debug("Flight not found: %s on %s", flight_no_clean, date_local)
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=30)
+            if resp.status_code == 404:
+                logger.debug("Flight not found: %s on %s", flight_no_clean, date_local)
+                return None
+            if resp.status_code == 429:
+                wait = 10 * attempt   # back-off: 10s, 20s, 30s
+                logger.warning("Rate limited by AeroDataBox — pausing %ds (attempt %d)", wait, attempt)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                return data[0]
             return None
-        if resp.status_code == 429:
-            logger.warning("Rate limited by AeroDataBox — pausing 10s")
-            time.sleep(10)
+
+        except requests.exceptions.ConnectionError as e:
+            # DNS resolution failure or connection reset — transient network issue.
+            # Retry up to MAX_RETRIES with exponential back-off before giving up.
+            wait = 2 ** attempt   # 2s, 4s, 8s
+            if attempt < MAX_RETRIES:
+                logger.debug(
+                    "Flight Status connection error for %s (attempt %d/%d) — retrying in %ds: %s",
+                    flight_no_clean, attempt, MAX_RETRIES, wait, e,
+                )
+                time.sleep(wait)
+            else:
+                logger.warning(
+                    "Flight Status API error for %s on %s: %s",
+                    flight_no_clean, date_local, e,
+                )
+                return None
+
+        except requests.exceptions.Timeout:
+            logger.warning("Flight Status API timeout for %s on %s (attempt %d)", flight_no_clean, date_local, attempt)
+            if attempt < MAX_RETRIES:
+                time.sleep(2 ** attempt)
+            else:
+                return None
+
+        except requests.RequestException as e:
+            logger.warning("Flight Status API error for %s on %s: %s", flight_no_clean, date_local, e)
             return None
-        resp.raise_for_status()
-        data = resp.json()
-        # API returns a list of flights for that number on that date
-        if isinstance(data, list) and len(data) > 0:
-            return data[0]   # take the first match (most relevant)
-        return None
-    except requests.RequestException as e:
-        logger.warning("Flight Status API error for %s on %s: %s", flight_no_clean, date_local, e)
-        return None
+
+    return None
 
 
 # ── Parse a flight status response dict ─────────────────────────────────────
@@ -231,6 +260,21 @@ def update_flight_status(delay_between_calls: float = 0.5) -> None:
         return
 
     logger.info("Fetching Flight Status for %d unique flights...", len(rows))
+
+    # ── Connectivity pre-check ──────────────────────────────────────────────
+    # If DNS resolution fails for the AeroDataBox host, skip the entire batch
+    # rather than logging hundreds of identical NameResolutionError warnings.
+    # This happens when the machine loses internet mid-cycle (e.g. sleep/wake).
+    import socket
+    try:
+        socket.getaddrinfo(RAPIDAPI_HOST, 443, socket.AF_INET)
+    except socket.gaierror:
+        logger.warning(
+            "[update_flight_status] Cannot resolve %s — network unavailable. "
+            "Skipping Flight Status update this cycle.",
+            RAPIDAPI_HOST,
+        )
+        return
 
     # ── 2. Fetch status for each ────────────────────────────────────────────
     records = []

@@ -8,6 +8,7 @@ Runs a single combined refresh cycle on one interval:
   STEP 3 — Feature build pass 1            → featured_muc_rxn_wx3
   STEP 4 — Feature build pass 2            → featured_muc_rxn_wx3_fe
   STEP 5 — Flight Status API               → flight_status_live
+  STEP 6 — Delay Analytics Snapshot        → flight_delay_snapshots (upsert)
 
 Running FIDS and Flight Status in the SAME cycle guarantees that
 confirmed_delay_min and dep/arr_best_utc always refer to the same
@@ -66,6 +67,7 @@ def _run_full_refresh():
       3. Features — build featured_muc_rxn_wx3
       4. Features — build featured_muc_rxn_wx3_fe  (what /flights reads)
       5. Status   — Aerodatabox Flight Status API  → flight_status_live
+      6. Snapshot — Resolve tier-priority delay + upsert analytics table
 
     Steps 1-4 and Step 5 run in the same cycle so FIDS data and
     Flight Status data are always from the same refresh timestamp.
@@ -117,30 +119,32 @@ def _run_full_refresh():
         logger.warning("[background] Step 4/5 ✗ Feature build pass 2 failed: %s", e)
         _state["last_error"] = str(e)
 
-    # ── Step 5: Batch ML predictions ─────────────────────────────────────────
-    # Runs after feature rebuild — flight_predictions is always in sync with
-    # the current featured_muc_rxn_wx3_fe window.
-    try:
-        from run_batch_predictions import run_batch_predictions
-        n = run_batch_predictions()
-        logger.info("[background] Step 5/6 ✓ Batch predictions written (%d rows).", n)
-    except Exception as e:
-        logger.warning("[background] Step 5/6 ✗ Batch predictions failed: %s", e)
-        _state["last_error"] = str(e)
-
-    # ── Step 6: Flight Status API ─────────────────────────────────────────────
-    # Runs LAST so confirmed_delay_min always shares the same refresh window
-    # as flight_predictions and featured_muc_rxn_wx3_fe.
-    #─────────────────────────────────────────────
+    # ── Step 5: Flight Status API ─────────────────────────────────────────────
     # Runs AFTER feature rebuild so it sees the latest flights_raw rows.
     # This guarantees Flight Status and FIDS data share the same cycle timestamp.
     try:
         from update_flight_status import update_flight_status
         update_flight_status()
         _state["status_last_ran"] = datetime.now(timezone.utc)
-        logger.info("[background] Step 6/6 ✓ Flight Status updated.")
+        logger.info("[background] Step 5/6 ✓ Flight Status updated.")
     except Exception as e:
-        logger.warning("[background] Step 6/6 ✗ Flight Status failed: %s", e)
+        logger.warning("[background] Step 5/6 ✗ Flight Status failed: %s", e)
+        _state["last_error"] = str(e)
+
+    # ── Step 6: Delay Analytics Snapshot ─────────────────────────────────────
+    # Reads the fully-resolved flight state (same JOIN as /flights endpoint:
+    # featured_muc_rxn_wx3_fe + flight_status_live + flight_predictions) and
+    # applies the same 3-tier priority logic as predictionService.js before
+    # upserting into flight_delay_snapshots.
+    # UPSERT (not replace): history accumulates across refresh cycles so the
+    # dashboard trend + cause charts improve as more data comes in.
+    # Non-fatal: failure here does not affect flights table or ML predictions.
+    try:
+        from snapshot_delay_analytics import snapshot_delay_analytics
+        snapshot_delay_analytics()
+        logger.info("[background] Step 6/6 ✓ Delay analytics snapshot written.")
+    except Exception as e:
+        logger.warning("[background] Step 6/6 ✗ Delay analytics snapshot failed: %s", e)
         _state["last_error"] = str(e)
 
     _state["last_ran"] = cycle_start
