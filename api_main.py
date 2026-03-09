@@ -625,21 +625,30 @@ def simulate_flight(req: SimulateRequest):
         }
 
         def apply_override(df, candidates, value):
-            """Try each candidate column name; apply to the first found."""
+            """Try each candidate column name; apply to the first found.
+            Also recomputes all derived binary flag columns that depend on the
+            overridden value — using the EXACT same thresholds as
+            build_featured_muc_rxn_wx3_fe.py.
+            """
             for col in candidates:
                 if col in df.columns:
                     df[col] = value
-                    # Also update derived weather flags if wind changes
-                    if "wind" in col:
-                        if "flag_strong_wind_muc" in df.columns:
-                            df["flag_strong_wind_muc"] = int(value >= 50)
-                        if "flag_gusts_muc" in df.columns:
-                            df["flag_gusts_muc"] = int(value >= 70)
-                    if "precipitation" in col or "snowfall" in col:
-                        if "flag_any_precip_muc" in df.columns:
-                            df["flag_any_precip_muc"] = int(value > 0)
-                        if "flag_any_snow_muc" in df.columns and "snow" in col:
-                            df["flag_any_snow_muc"] = int(value > 0)
+                    # ── Wind flags (thresholds from build_featured_muc_rxn_wx3_fe.py) ──
+                    if "wind_speed" in col:
+                        if "muc_wind_strong" in df.columns:
+                            df["muc_wind_strong"] = int(value >= 25)   # ≥25 km/h
+                    if "wind_gusts" in col:
+                        if "muc_gust_strong" in df.columns:
+                            df["muc_gust_strong"] = int(value >= 40)   # ≥40 km/h
+                    # ── Precip/snow flags ───────────────────────────────────────────
+                    if "precipitation" in col:
+                        if "muc_precip_any" in df.columns:
+                            df["muc_precip_any"] = int(value > 0)
+                    if "snowfall" in col:
+                        if "muc_snow_any" in df.columns:
+                            df["muc_snow_any"] = int(value > 0)
+                        if "muc_precip_any" in df.columns and value > 0:
+                            df["muc_precip_any"] = 1   # snow counts as precipitation
                     return True
             return False
 
@@ -660,18 +669,28 @@ def simulate_flight(req: SimulateRequest):
                     break
 
         # Congestion overrides
+        # Actual column names from build_featured_muc_rxn_wx3_fe.py:
+        #   muc_arr_cnt_pm1h / muc_dep_cnt_pm1h  (±1h rolling count)
+        #   muc_arr_cnt_pm2h / muc_dep_cnt_pm2h  (±2h rolling count, scale proportionally)
         if req.muc_arr_1h is not None:
-            for col in ["muc_arr_1h", "arr_1h"]:
+            for col in ["muc_arr_cnt_pm1h", "muc_arr_1h", "arr_1h"]:
                 if col in df_sim.columns:
                     df_sim[col] = req.muc_arr_1h
                     override_applied["muc_arr_1h"] = req.muc_arr_1h
+                    # Also scale ±2h count proportionally if present
+                    pm2h = col.replace("pm1h", "pm2h")
+                    if pm2h in df_sim.columns:
+                        df_sim[pm2h] = req.muc_arr_1h * 1.8
                     break
 
         if req.muc_dep_1h is not None:
-            for col in ["muc_dep_1h", "dep_1h"]:
+            for col in ["muc_dep_cnt_pm1h", "muc_dep_1h", "dep_1h"]:
                 if col in df_sim.columns:
                     df_sim[col] = req.muc_dep_1h
                     override_applied["muc_dep_1h"] = req.muc_dep_1h
+                    pm2h = col.replace("pm1h", "pm2h")
+                    if pm2h in df_sim.columns:
+                        df_sim[pm2h] = req.muc_dep_1h * 1.8
                     break
 
         # ── 7. Simulated prediction ─────────────────────────────
