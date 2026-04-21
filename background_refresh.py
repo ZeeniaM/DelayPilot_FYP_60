@@ -157,16 +157,22 @@ def _run_full_refresh():
 
 def _scheduler_loop():
     """
-    Daemon loop — fires _run_full_refresh() immediately on startup,
-    then every REFRESH_INTERVAL_SEC.
+    Daemon loop — waits REFRESH_INTERVAL_SEC before the first refresh,
+    then repeats every REFRESH_INTERVAL_SEC thereafter.
+ 
+    startup_delaypilot.py already runs run_pipeline.py synchronously before
+    the API starts, so all tables are fresh at boot. The first background
+    cycle is intentionally deferred to avoid a redundant double-refresh and
+    an unnecessary second Aerodatabox API call at startup.
     """
     logger.info(
-        "[background] Scheduler started — full refresh every %d min.",
+        "[background] Scheduler started — first refresh in %d min, then every %d min.",
+        REFRESH_INTERVAL_SEC // 60,
         REFRESH_INTERVAL_SEC // 60,
     )
-
-    last_ran = 0.0   # ensures first iteration fires immediately
-
+ 
+    last_ran = time.monotonic()   # ← defers first run by REFRESH_INTERVAL_SEC
+ 
     while True:
         now = time.monotonic()
         if now - last_ran >= REFRESH_INTERVAL_SEC:
@@ -177,9 +183,9 @@ def _scheduler_loop():
             )
             t.start()
             last_ran = now
-
-        time.sleep(60)   # check every 60 s
-
+ 
+        time.sleep(60)   # check every 60 s — lightweight, no busy-wait
+ 
 
 # ── Public entry point ────────────────────────────────────────────────────────
 

@@ -422,7 +422,7 @@ def get_flights(date: str = None):
             params["date"] = date
 
         q = text(f"""
-            SELECT
+            SELECT DISTINCT ON (f.number_raw, f.sched_utc)
                 f.number_raw,
                 f.sched_utc,
                 f.movement,
@@ -460,7 +460,7 @@ def get_flights(date: str = None):
                   AND (
                       (f.movement = 'departure' AND r.dep_sched_utc = f.sched_utc)
                    OR (f.movement = 'arrival'   AND r.arr_sched_utc = f.sched_utc)
-                  )
+                      )
             LEFT JOIN flight_status_live s
                    ON s.number_raw  = f.number_raw
                   AND s.flight_date = DATE(f.sched_utc AT TIME ZONE 'UTC')
@@ -468,7 +468,7 @@ def get_flights(date: str = None):
                    ON p.number_raw = f.number_raw
                   AND p.sched_utc  = f.sched_utc
             {date_filter}
-            ORDER BY f.sched_utc
+            ORDER BY f.number_raw, f.sched_utc
         """)
 
         with engine.connect() as conn:
@@ -930,6 +930,7 @@ def get_delay_trends(date: str = None):
     except Exception as e:
         logger.error("/flights/analytics error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # For running with: python api_main.py (useful in dev)
 if __name__ == "__main__":

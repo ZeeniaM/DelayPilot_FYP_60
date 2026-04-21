@@ -62,12 +62,20 @@ def run():
     else:
         logger.info("Skipping cleaning step (per --no-clean).")
 
-    logger.info("Step 7/7: Run batch ML predictions -> flight_predictions")
+    logger.info("Step 7/8: Run batch ML predictions -> flight_predictions")
     try:
         n = run_batch_predictions()
-        logger.info("Step 7/7: Wrote %d predictions to flight_predictions.", n)
+        logger.info("Step 7/8: Wrote %d predictions to flight_predictions.", n)
     except Exception as e:
-        logger.warning("Step 7/7: Batch predictions failed (non-fatal): %s", e)
+        logger.warning("Step 7/8: Batch predictions failed (non-fatal): %s", e)
+
+    logger.info("Step 8/8: Snapshot delay analytics -> flight_delay_snapshots")
+    try:
+        from snapshot_delay_analytics import snapshot_delay_analytics
+        snapshot_delay_analytics()
+        logger.info("Step 8/8: Delay analytics snapshot written.")
+    except Exception as e:
+        logger.warning("Step 8/8: Delay analytics snapshot failed (non-fatal): %s", e)
 
     logger.info("Pipeline run complete.")
 
