@@ -389,6 +389,171 @@ def health() -> Dict[str, Any]:
         "running":         state["running"],
     }
 
+@app.get("/flights/propagation")
+def get_flight_propagation(
+    number_raw: str = Query(...),
+    sched_utc: str = Query(...),
+):
+    """
+    Return connected flights that share the same aircraft tail as the source flight
+    and are scheduled later the same day, with propagated delay estimates.
+    """
+    try:
+        try:
+            sched_dt = _parse_sched_utc(sched_utc)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid sched_utc: {exc}")
+
+        # ── 1. Fetch source flight ────────────────────────────────────────────
+        src_q = text("""
+            SELECT
+                f.aircraft_modeS,
+                f.y_delay_min,
+                f.movement,
+                f.other_airport_icao,
+                f.airline_iata,
+                COALESCE(s.op_status, 'Scheduled') AS op_status,
+                s.confirmed_delay_min,
+                p.minutes_ui  AS ml_minutes_ui,
+                p.p_delay_15
+            FROM featured_muc_rxn_wx3_fe f
+            LEFT JOIN flight_status_live s
+                   ON s.number_raw  = f.number_raw
+                  AND s.flight_date = DATE(f.sched_utc AT TIME ZONE 'UTC')
+            LEFT JOIN flight_predictions p
+                   ON p.number_raw = f.number_raw
+                  AND p.sched_utc  = f.sched_utc
+            WHERE f.number_raw = :number_raw
+              AND f.sched_utc  = :sched_utc
+            LIMIT 1
+        """)
+        with engine.connect() as conn:
+            src = conn.execute(src_q, {"number_raw": number_raw, "sched_utc": sched_dt}).fetchone()
+
+        if src is None:
+            raise HTTPException(status_code=404, detail="Source flight not found.")
+
+        aircraft_modeS      = src[0]
+        y_delay_min         = src[1]
+        confirmed_delay_min = src[6]
+        ml_minutes_ui       = src[7]
+        p_delay_15          = src[8]
+
+        if not aircraft_modeS:
+            return {"connected_flights": [], "reason": "No aircraft tail data available"}
+
+        # ── 2. Resolve source delay (3-tier priority) ─────────────────────────
+        if confirmed_delay_min is not None:
+            source_delay = float(confirmed_delay_min)
+        elif y_delay_min is not None and (float(y_delay_min) >= 15 or float(y_delay_min) < 0):
+            source_delay = float(y_delay_min)
+        elif ml_minutes_ui is not None and float(ml_minutes_ui) >= 5:
+            source_delay = float(ml_minutes_ui)
+        else:
+            source_delay = None
+
+        # ── 3. Propagation estimate ───────────────────────────────────────────
+        if source_delay is not None and p_delay_15 is not None:
+            propagation_estimate = round(float(source_delay) * float(p_delay_15) * 0.6, 1)
+        else:
+            propagation_estimate = None
+
+        # ── 4. Query connected flights ────────────────────────────────────────
+        conn_q = text("""
+            SELECT
+                f.number_raw,
+                f.airline_iata,
+                f.movement,
+                f.other_airport_icao,
+                f.sched_utc,
+                f.y_delay_min,
+                COALESCE(s.op_status, 'Scheduled') AS op_status,
+                s.confirmed_delay_min,
+                p.minutes_ui AS ml_minutes_ui
+            FROM featured_muc_rxn_wx3_fe f
+            LEFT JOIN flight_status_live s
+                   ON s.number_raw  = f.number_raw
+                  AND s.flight_date = DATE(f.sched_utc AT TIME ZONE 'UTC')
+            LEFT JOIN flight_predictions p
+                   ON p.number_raw = f.number_raw
+                  AND p.sched_utc  = f.sched_utc
+            WHERE f.aircraft_modeS = :modeS
+              AND f.sched_utc > :sched_utc
+              AND DATE(f.sched_utc AT TIME ZONE 'UTC') = DATE(:sched_utc AT TIME ZONE 'UTC')
+            ORDER BY f.sched_utc ASC
+            LIMIT 2
+        """)
+        with engine.connect() as conn:
+            conn_rows = conn.execute(conn_q, {"modeS": aircraft_modeS, "sched_utc": sched_dt}).fetchall()
+
+        # ── 5. Build response ─────────────────────────────────────────────────
+        def _resolve_delay(conf, fids, ml, prop_est):
+            if conf is not None:
+                return float(conf), "confirmed"
+            if fids is not None and (float(fids) >= 15 or float(fids) < 0):
+                return float(fids), "fids"
+            if ml is not None and float(ml) >= 5:
+                return float(ml), "model"
+            if prop_est is not None:
+                return prop_est, "model_propagation"
+            return None, "none"
+
+        def _delay_status(op_status, resolved_delay):
+            if op_status in ("Landed", "Cancelled", "Diverted"):
+                return op_status
+            if resolved_delay is None:
+                return "On Time"
+            if resolved_delay >= 30:
+                return "Major Delay"
+            if resolved_delay >= 5:
+                return "Minor Delay"
+            if resolved_delay < 0:
+                return "Early"
+            return "On Time"
+
+        connected = []
+        for r in conn_rows:
+            c_number_raw        = r[0]
+            c_airline_iata      = r[1]
+            c_movement          = (r[2] or "").lower()
+            c_other_airport     = (r[3] or "").upper()
+            c_sched_utc         = r[4]
+            c_y_delay_min       = r[5]
+            c_op_status         = r[6]
+            c_confirmed_delay   = r[7]
+            c_ml_minutes_ui     = r[8]
+
+            resolved_delay, delay_source = _resolve_delay(
+                c_confirmed_delay, c_y_delay_min, c_ml_minutes_ui, propagation_estimate
+            )
+
+            status = _delay_status(c_op_status, resolved_delay)
+
+            if c_movement == "departure":
+                route = f"MUC → {c_other_airport}" if c_other_airport else "MUC → ?"
+            else:
+                route = f"{c_other_airport} → MUC" if c_other_airport else "? → MUC"
+
+            connected.append({
+                "number_raw":         c_number_raw,
+                "airline_iata":       c_airline_iata,
+                "route":              route,
+                "sched_utc":          str(c_sched_utc),
+                "resolved_delay_min": resolved_delay,
+                "delay_source":       delay_source,
+                "delay_status":       status,
+                "is_propagated":      delay_source == "model_propagation",
+            })
+
+        return {"connected_flights": connected}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("/flights/propagation error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # NEW ENDPOINTS ADDED
 """
 api_main.py  — PATCH for /flights endpoint
