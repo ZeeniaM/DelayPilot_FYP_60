@@ -58,6 +58,18 @@ engine = get_engine()
 # ── Background refresh scheduler ─────────────────────────────
 from background_refresh import start_background_refresh, get_refresh_state
 
+
+def _health_payload() -> Dict[str, Any]:
+    state = get_refresh_state()
+    return {
+        "status":          "ok",
+        "last_ran":        state["last_ran"].isoformat()        if state["last_ran"]        else None,
+        "fids_last_ran":   state["fids_last_ran"].isoformat()   if state["fids_last_ran"]   else None,
+        "status_last_ran": state["status_last_ran"].isoformat() if state["status_last_ran"] else None,
+        "running":         state["running"],
+    }
+
+
 @app.on_event("startup")
 def on_startup():
     # Ensure flight_status_live exists before any request tries to JOIN it
@@ -379,14 +391,23 @@ def predict_from_db(req: DbPredictionRequest):
 # Replace existing /health with this
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    from background_refresh import get_refresh_state
+    return _health_payload()
+
+
+@app.get("/pipeline-logs")
+def pipeline_logs() -> Dict[str, Any]:
+    from background_refresh import get_pipeline_log, get_refresh_state
+    logs = get_pipeline_log()
     state = get_refresh_state()
     return {
-        "status":          "ok",
-        "last_ran":        str(state["last_ran"])        if state["last_ran"]        else "pending",
-        "fids_last_ran":   str(state["fids_last_ran"])   if state["fids_last_ran"]   else "pending",
-        "status_last_ran": str(state["status_last_ran"]) if state["status_last_ran"] else "pending",
-        "running":         state["running"],
+        "logs": logs,
+        "health": {
+            "last_ran": str(state["last_ran"]) if state["last_ran"] else None,
+            "fids_last_ran": str(state["fids_last_ran"]) if state["fids_last_ran"] else None,
+            "status_last_ran": str(state["status_last_ran"]) if state["status_last_ran"] else None,
+            "running": state["running"],
+            "last_error": state.get("last_error"),
+        },
     }
 
 @app.get("/flights/propagation")
