@@ -220,10 +220,10 @@ def _run_full_refresh():
     try:
         from ingest_weather_live import update_weather_live
         update_weather_live()
-        logger.info("[background] Step 1/5 ✓ Weather updated.")
+        logger.info("[background] Step 1/6 ✓ Weather updated.")
         _log_step_success(1, "Weather")
     except Exception as e:
-        logger.warning("[background] Step 1/5 ✗ Weather update failed: %s", e)
+        logger.warning("[background] Step 1/6 ✗ Weather update failed: %s", e)
         _state["last_error"] = str(e)
         _log_step_failure(1, "Weather", e)
 
@@ -232,10 +232,10 @@ def _run_full_refresh():
         from ingest_flights_live import ingest_live_muc_window
         ingest_live_muc_window()
         _state["fids_last_ran"] = datetime.now(timezone.utc)
-        logger.info("[background] Step 2/5 ✓ FIDS ingested.")
+        logger.info("[background] Step 2/6 ✓ FIDS ingested.")
         _log_step_success(2, "FIDS")
     except Exception as e:
-        logger.warning("[background] Step 2/5 ✗ FIDS ingest failed: %s", e)
+        logger.warning("[background] Step 2/6 ✗ FIDS ingest failed: %s", e)
         _state["last_error"] = str(e)
         _log_step_failure(2, "FIDS", e)
 
@@ -243,10 +243,10 @@ def _run_full_refresh():
     try:
         from build_featured_muc_rxn_wx3 import build_featured_muc_rxn_wx3
         build_featured_muc_rxn_wx3()
-        logger.info("[background] Step 3/5 ✓ featured_muc_rxn_wx3 rebuilt.")
+        logger.info("[background] Step 3/6 ✓ featured_muc_rxn_wx3 rebuilt.")
         _log_step_success(3, "Feature build 1")
     except Exception as e:
-        logger.warning("[background] Step 3/5 ✗ Feature build pass 1 failed: %s", e)
+        logger.warning("[background] Step 3/6 ✗ Feature build pass 1 failed: %s", e)
         _state["last_error"] = str(e)
         _log_step_failure(3, "Feature build 1", e)
 
@@ -254,10 +254,10 @@ def _run_full_refresh():
     try:
         from build_featured_muc_rxn_wx3_fe import build_featured_muc_rxn_wx3_fe
         build_featured_muc_rxn_wx3_fe()
-        logger.info("[background] Step 4/5 ✓ featured_muc_rxn_wx3_fe rebuilt.")
+        logger.info("[background] Step 4/6 ✓ featured_muc_rxn_wx3_fe rebuilt.")
         _log_step_success(4, "Feature build 2")
     except Exception as e:
-        logger.warning("[background] Step 4/5 ✗ Feature build pass 2 failed: %s", e)
+        logger.warning("[background] Step 4/6 ✗ Feature build pass 2 failed: %s", e)
         _state["last_error"] = str(e)
         _log_step_failure(4, "Feature build 2", e)
 
