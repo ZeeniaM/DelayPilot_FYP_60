@@ -634,6 +634,9 @@ def get_flights(date: str = None):
     If no status record exists, op_status defaults to 'Scheduled'.
     """
     try:
+        def _iso(value):
+            return value.isoformat() if value is not None else None
+
         date_filter = ""
         params = {}
         if date:
@@ -646,7 +649,7 @@ def get_flights(date: str = None):
                 f.sched_utc,
                 f.movement,
                 f.airline_iata,
-                f.other_airport_icao   AS destination,
+                f.other_airport_icao,
                 f.y_delay_min,
                 f.y_bin15,
                 f.y_bin30,
@@ -696,9 +699,10 @@ def get_flights(date: str = None):
         return [
             {
                 "number_raw":            r[0],
-                "sched_utc":             str(r[1]),
+                "sched_utc":             _iso(r[1]),
                 "movement":              r[2],
                 "airline_iata":          r[3],
+                "other_airport_icao":    r[4],
                 "destination":           r[4],
                 "delay_min":             float(r[5]) if r[5] is not None else None,
                 "is_delayed_15":         bool(r[6])  if r[6] is not None else None,
@@ -706,13 +710,13 @@ def get_flights(date: str = None):
                 # Weather for cause derivation
                 "wx_muc_weather_code":   float(r[8]) if r[8] is not None else None,
                 "wx_muc_precipitation":  float(r[9]) if r[9] is not None else None,
-                "actual_utc":            str(r[10])  if r[10] is not None else None,
+                "actual_utc":            _iso(r[10]),
                 # Status fields
                 "op_status":             r[11],
-                "etd_utc":               str(r[12])  if r[12] is not None else None,
-                "atd_utc":               str(r[13])  if r[13] is not None else None,
-                "eta_utc":               str(r[14])  if r[14] is not None else None,
-                "ata_utc":               str(r[15])  if r[15] is not None else None,
+                "etd_utc":               _iso(r[12]),
+                "atd_utc":               _iso(r[13]),
+                "eta_utc":               _iso(r[14]),
+                "ata_utc":               _iso(r[15]),
                 "confirmed_delay_min":   float(r[16]) if r[16] is not None else None,
                 # ML batch predictions
                 "ml_minutes_ui":         float(r[17]) if r[17] is not None else None,
@@ -764,7 +768,11 @@ class SimulateRequest(BaseModel):
     # ── Congestion overrides ────────────────────────────────────
     # These are rolling counts of flights at MUC around sched_utc
     # muc_arr_1h / muc_dep_1h — arrivals/departures in ±1h window
+    # These inputs override MUC rolling congestion features around sched_utc.
+    # The underlying pm1h columns are 3-hour rolling sums, not single-hour counts.
+    # Maps to muc_arr_cnt_pm1h, a 3-hour rolling sum (±1h window).
     muc_arr_1h: Optional[float] = None
+    # Maps to muc_dep_cnt_pm1h, a 3-hour rolling sum (±1h window).
     muc_dep_1h: Optional[float] = None
 
 
@@ -881,14 +889,20 @@ def simulate_flight(req: SimulateRequest):
 
         # Reactionary override
         if req.prev_delay_min_safe is not None:
+            val = req.prev_delay_min_safe
             for col in ["prev_delay_min_safe", "reactionary_delay_min"]:
                 if col in df_sim.columns:
-                    df_sim[col] = req.prev_delay_min_safe
-                    override_applied["prev_delay_min_safe"] = req.prev_delay_min_safe
-                    break
+                    df_sim[col] = val
+            if "prev_late15_safe" in df_sim.columns:
+                df_sim["prev_late15_safe"] = int(val >= 15)
+            if "prev_late30_safe" in df_sim.columns:
+                df_sim["prev_late30_safe"] = int(val >= 30)
+            override_applied["prev_delay_min_safe"] = val
 
         # Congestion overrides
         # Actual column names from build_featured_muc_rxn_wx3_fe.py:
+        # pm1h columns are 3-hour rolling sums and pm2h columns are 5-hour rolling sums.
+        # Airline-level congestion features are also updated proportionally when airport-level values change.
         #   muc_arr_cnt_pm1h / muc_dep_cnt_pm1h  (±1h rolling count)
         #   muc_arr_cnt_pm2h / muc_dep_cnt_pm2h  (±2h rolling count, scale proportionally)
         if req.muc_arr_1h is not None:
@@ -899,8 +913,15 @@ def simulate_flight(req: SimulateRequest):
                     # Also scale ±2h count proportionally if present
                     pm2h = col.replace("pm1h", "pm2h")
                     if pm2h in df_sim.columns:
-                        df_sim[pm2h] = req.muc_arr_1h * 1.8
+                        df_sim[pm2h] = req.muc_arr_1h * (5.0 / 3.0)
                     break
+            airline_arr_estimate = req.muc_arr_1h * 0.15
+            for col in ["air_arrival_cnt_pm1h"]:
+                if col in df_sim.columns:
+                    df_sim[col] = airline_arr_estimate
+            for col in ["air_arrival_cnt_pm2h"]:
+                if col in df_sim.columns:
+                    df_sim[col] = airline_arr_estimate * (5.0 / 3.0)
 
         if req.muc_dep_1h is not None:
             for col in ["muc_dep_cnt_pm1h", "muc_dep_1h", "dep_1h"]:
@@ -909,8 +930,15 @@ def simulate_flight(req: SimulateRequest):
                     override_applied["muc_dep_1h"] = req.muc_dep_1h
                     pm2h = col.replace("pm1h", "pm2h")
                     if pm2h in df_sim.columns:
-                        df_sim[pm2h] = req.muc_dep_1h * 1.8
+                        df_sim[pm2h] = req.muc_dep_1h * (5.0 / 3.0)
                     break
+            airline_dep_estimate = req.muc_dep_1h * 0.15
+            for col in ["air_departure_cnt_pm1h"]:
+                if col in df_sim.columns:
+                    df_sim[col] = airline_dep_estimate
+            for col in ["air_departure_cnt_pm2h"]:
+                if col in df_sim.columns:
+                    df_sim[col] = airline_dep_estimate * (5.0 / 3.0)
 
         # ── 7. Simulated prediction ─────────────────────────────
         simulated = model_service.predict_one(df_sim)
