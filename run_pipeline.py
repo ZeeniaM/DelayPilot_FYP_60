@@ -41,23 +41,23 @@ def run():
 
     logger.info("Starting DelayPilot pipeline (PostgreSQL)")
 
-    logger.info("Step 1/6: Ingest weather CSV -> weather_hourly")
+    logger.info("Step 1/8: Ingest weather CSV -> weather_hourly")
     load_weather_csv_to_db()
 
-    logger.info("Step 2/6: Ingest flight parquet (sample 50k) -> flights_raw")
+    logger.info("Step 2/8: Ingest flight parquet (sample 50k) -> flights_raw")
     load_flight_parquet_to_db()
 
-    logger.info("Step 3/6: Build featured_muc_rxn_wx3 (reactionary + weather joins)")
+    logger.info("Step 3/8: Build featured_muc_rxn_wx3 (reactionary + weather joins)")
     build_featured_muc_rxn_wx3()
 
-    logger.info("Step 4/6: Build featured_muc_rxn_wx3_fe (congestion + history + flags)")
+    logger.info("Step 4/8: Build featured_muc_rxn_wx3_fe (congestion + history + flags)")
     build_featured_muc_rxn_wx3_fe()
 
-    logger.info("Step 5/6: Build joined features -> training_features_v3")
+    logger.info("Step 5/8: Build joined features -> training_features_v3")
     build_features()
 
     if not args.no_clean:
-        logger.info("Step 6/6: Clean features -> training_features_v3_clean")
+        logger.info("Step 6/8: Clean features -> training_features_v3_clean")
         clean_training_features()
     else:
         logger.info("Skipping cleaning step (per --no-clean).")

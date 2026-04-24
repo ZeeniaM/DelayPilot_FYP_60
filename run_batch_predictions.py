@@ -65,6 +65,15 @@ from model_service import V3FinalModelService
 logger = logging.getLogger(__name__)
 
 
+CAUSE_LABEL_MAP = {
+    "Weather (MUC)": "Weather",
+    "En-Route Weather": "Weather",
+    "Reactionary": "Reactionary",
+    "ATC / Congestion": "Congestion",
+    "Airline / Turnaround": "Airline",
+}
+
+
 def get_engine():
     return create_engine(get_connection_string())
 
@@ -132,9 +141,9 @@ def _derive_cause_scores(row: dict) -> dict[str, float]:
     prev_late15 = _f("prev_late15_safe")
     prev_late30 = _f("prev_late30_safe")
     prev_delay  = _f("prev_delay_min_safe")
-    rxn_score += prev_late30 * 0.60
-    rxn_score += prev_late15 * 0.35
-    rxn_score += min(prev_delay / 60.0, 1.0) * 0.30  # scale 60 min → full score
+    rxn_score += prev_late30 * 0.35
+    rxn_score += prev_late15 * 0.20
+    rxn_score += min(prev_delay / 45.0, 1.0) * 0.50
     scores["Reactionary"] = min(rxn_score, 1.0)
 
     # ── 4. ATC / Airport Congestion ──────────────────────────────────────────
@@ -146,9 +155,9 @@ def _derive_cause_scores(row: dict) -> dict[str, float]:
     arr_pm2h = _f("muc_arr_cnt_pm2h")
     total_pm1h = dep_pm1h + arr_pm1h
     total_pm2h = dep_pm2h + arr_pm2h
-    # Normalise: 60 movements in 3h window = capacity pressure
-    congestion_score = min(total_pm1h / 60.0, 1.0) * 0.50
-    congestion_score += min(total_pm2h / 100.0, 1.0) * 0.30
+    # Normalise to typical MUC rolling traffic rather than routine baseline flow.
+    congestion_score = min(total_pm1h / 120.0, 1.0) * 0.50
+    congestion_score += min(total_pm2h / 200.0, 1.0) * 0.30
     scores["ATC / Congestion"] = min(congestion_score, 1.0)
 
     # ── 5. Airline / Turnaround ───────────────────────────────────────────────
@@ -158,9 +167,9 @@ def _derive_cause_scores(row: dict) -> dict[str, float]:
     route_mean  = _f("route_mean_delay_past")
     air_mean    = _f("air_mean_delay_past")
     airline_score = 0.0
-    airline_score += min((air_dep + air_arr) / 20.0, 1.0) * 0.30   # busy airline ops
-    airline_score += min(route_mean / 30.0, 1.0)          * 0.40   # chronic route delay
-    airline_score += min(air_mean   / 20.0, 1.0)          * 0.30   # chronic airline delay
+    airline_score += min((air_dep + air_arr) / 20.0, 1.0) * 0.20
+    airline_score += min(route_mean / 20.0, 1.0)          * 0.50
+    airline_score += min(air_mean   / 15.0, 1.0)          * 0.30
     scores["Airline / Turnaround"] = min(airline_score, 1.0)
 
     return scores
@@ -190,7 +199,7 @@ def _derive_ml_cause(row: dict, pred_delay_15: int, minutes_ui: float) -> tuple[
         # Fallback: all signals zero → label by magnitude alone
         if minutes_ui >= 30:
             return "Reactionary", {"Reactionary": 100}
-        return "ATC / Congestion", {"ATC / Congestion": 100}
+        return "Congestion", {"Congestion": 100}
 
     pct = {k: round(v / total * 100) for k, v in scores.items()}
 
@@ -202,7 +211,19 @@ def _derive_ml_cause(row: dict, pred_delay_15: int, minutes_ui: float) -> tuple[
 
     # Primary cause = highest scoring category
     primary = max(scores, key=lambda k: scores[k])
-    return primary, pct
+    primary_ui = CAUSE_LABEL_MAP.get(primary, primary)
+
+    pct_mapped = {}
+    for key, value in pct.items():
+        mapped_key = CAUSE_LABEL_MAP.get(key, key)
+        pct_mapped[mapped_key] = pct_mapped.get(mapped_key, 0) + value
+
+    # Adjust rounding again after merging duplicate UI labels (for example, weather buckets).
+    diff = 100 - sum(pct_mapped.values())
+    if diff != 0:
+        pct_mapped[primary_ui] = pct_mapped.get(primary_ui, 0) + diff
+
+    return primary_ui, pct_mapped
 
 
 def run_batch_predictions() -> int:
