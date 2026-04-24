@@ -137,8 +137,19 @@ class V3FinalModelService:
         for c in num_cols:
             X[c] = pd.to_numeric(X[c], errors="coerce")
 
+        # Replace inf values
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # Fill NaN in numeric columns
         X[num_cols] = X[num_cols].fillna(0)
+
+        # Handle pandas nullable integer NA (pd.NA) which is distinct from
+        # np.nan and is NOT caught by fillna(0) when dtype is still object.
+        # Convert all numeric columns to plain float64 - the only dtype
+        # CatBoost's C++ layer accepts without internal NaN conversion issues.
+        X[num_cols] = X[num_cols].apply(
+            lambda col: pd.to_numeric(col, errors="coerce").fillna(0.0).astype("float64")
+        )
 
         return X
 
@@ -158,44 +169,57 @@ class V3FinalModelService:
         try:
             X_df = self._to_feature_dataframe(feature_row)
             X_cb = self._prepare_for_catboost(X_df)
-
-            # Probabilities from classifiers
-            p15 = float(self.bin15.predict_proba(X_cb)[:, 1][0])
-            p30 = float(self.bin30.predict_proba(X_cb)[:, 1][0])
-
-            # Raw minutes from regressor
-            minutes_pred_raw = self.reg2.predict(X_cb)[0]
-            # Guard: CatBoost can return NaN for edge-case feature combinations.
-            # numpy NaN cannot be passed to int() — replace with 0.0 (on-time fallback).
             import math
-            minutes_pred = float(minutes_pred_raw) if not math.isnan(float(minutes_pred_raw)) else 0.0
+            import numpy as np
 
-            # Probabilities: also guard against NaN from classifier edge cases
-            if math.isnan(p15): p15 = 0.0
-            if math.isnan(p30): p30 = 0.0
+            # Classifier: bin15
+            try:
+                _p15_raw = self.bin15.predict_proba(X_cb)[:, 1][0]
+                p15 = float(_p15_raw)
+                if math.isnan(p15) or math.isinf(p15):
+                    p15 = 0.0
+            except Exception:
+                p15 = 0.0
 
-            # Thresholds from metadata — guard against NaN stored in JSON
-            thr15_raw = self.thresholds.get("bin15_best_valid", 0.3)
-            thr30_raw = self.thresholds.get("bin30_best_valid", 0.4)
+            # Classifier: bin30
+            try:
+                _p30_raw = self.bin30.predict_proba(X_cb)[:, 1][0]
+                p30 = float(_p30_raw)
+                if math.isnan(p30) or math.isinf(p30):
+                    p30 = 0.0
+            except Exception:
+                p30 = 0.0
+
+            # Regressor: reg2
+            try:
+                _min_raw = self.reg2.predict(X_cb)[0]
+                minutes_pred = float(np.nan_to_num(float(_min_raw), nan=0.0, posinf=0.0, neginf=0.0))
+            except Exception:
+                minutes_pred = 0.0
+
+            def _safe_float(val, default):
+                try:
+                    v = float(val)
+                    return default if (math.isnan(v) or math.isinf(v)) else v
+                except (TypeError, ValueError):
+                    return default
+
+            thr15 = _safe_float(self.thresholds.get("bin15_best_valid"), 0.3)
+            thr30 = _safe_float(self.thresholds.get("bin30_best_valid"), 0.4)
             reg_min_raw = self.thresholds.get("reg_train_delay_min", 5)
+            reg_train_min = int(_safe_float(reg_min_raw, 5.0))
 
-            thr15 = float(thr15_raw) if thr15_raw is not None and not math.isnan(float(thr15_raw)) else 0.3
-            thr30 = float(thr30_raw) if thr30_raw is not None and not math.isnan(float(thr30_raw)) else 0.4
-            reg_train_min = int(float(reg_min_raw)) if reg_min_raw is not None and not math.isnan(float(reg_min_raw)) else 5
+            pred15 = 1 if p15 >= thr15 else 0
+            pred30 = 1 if p30 >= thr30 else 0
 
-            # Binary labels
-            pred15 = int(p15 >= thr15)
-            pred30 = int(p30 >= thr30)
-
-            # UI logic from notebook:
-            # - if p30 high → at least 30 min
-            # - else if p15 high → at least reg_train_min (e.g. 5 min)
-            # - else → 0 (on time)
             if p30 >= thr30:
                 minutes_ui = max(minutes_pred, 30.0)
             elif p15 >= thr15:
                 minutes_ui = max(minutes_pred, float(reg_train_min))
             else:
+                minutes_ui = 0.0
+
+            if math.isnan(minutes_ui) or math.isinf(minutes_ui):
                 minutes_ui = 0.0
 
             return {

@@ -419,6 +419,20 @@ def get_flight_propagation(
     Return connected flights that share the same aircraft tail as the source flight
     and are scheduled later the same day, with propagated delay estimates.
     """
+    def safe_val(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float, str, bool)):
+            return v
+        try:
+            return v.isoformat()
+        except AttributeError:
+            pass
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return str(v)
+
     try:
         try:
             sched_dt = _parse_sched_utc(sched_utc)
@@ -454,14 +468,14 @@ def get_flight_propagation(
         if src is None:
             raise HTTPException(status_code=404, detail="Source flight not found.")
 
-        aircraft_modeS      = src[0]
-        y_delay_min         = src[1]
+        aircraft_modeS = src[0] if src else None
+        y_delay_min = src[1]
         confirmed_delay_min = src[6]
-        ml_minutes_ui       = src[7]
-        p_delay_15          = src[8]
+        ml_minutes_ui = src[7]
+        p_delay_15 = src[8]
 
         if not aircraft_modeS:
-            return {"connected_flights": [], "reason": "No aircraft tail data available"}
+            return {"propagation": [], "source": {}}
 
         # ── 2. Resolve source delay (3-tier priority) ─────────────────────────
         if confirmed_delay_min is not None:
@@ -532,17 +546,31 @@ def get_flight_propagation(
                 return "Early"
             return "On Time"
 
+        source_payload = {
+            "aircraft_modeS": safe_val(src[0]),
+            "y_delay_min": safe_val(src[1]),
+            "movement": safe_val(src[2]),
+            "other_airport_icao": safe_val(src[3]),
+            "airline_iata": safe_val(src[4]),
+            "op_status": safe_val(src[5]),
+            "confirmed_delay_min": safe_val(src[6]),
+            "ml_minutes_ui": safe_val(src[7]),
+            "p_delay_15": safe_val(src[8]),
+            "resolved_source_delay_min": safe_val(source_delay),
+            "propagation_estimate": safe_val(propagation_estimate),
+        }
+
         connected = []
         for r in conn_rows:
-            c_number_raw        = r[0]
-            c_airline_iata      = r[1]
-            c_movement          = (r[2] or "").lower()
-            c_other_airport     = (r[3] or "").upper()
-            c_sched_utc         = r[4]
-            c_y_delay_min       = r[5]
-            c_op_status         = r[6]
-            c_confirmed_delay   = r[7]
-            c_ml_minutes_ui     = r[8]
+            c_number_raw = r[0]
+            c_airline_iata = r[1]
+            c_movement = (r[2] or "").lower()
+            c_other_airport = (r[3] or "").upper()
+            c_sched_utc = r[4]
+            c_y_delay_min = r[5]
+            c_op_status = r[6]
+            c_confirmed_delay = r[7]
+            c_ml_minutes_ui = r[8]
 
             resolved_delay, delay_source = _resolve_delay(
                 c_confirmed_delay, c_y_delay_min, c_ml_minutes_ui, propagation_estimate
@@ -556,23 +584,28 @@ def get_flight_propagation(
                 route = f"{c_other_airport} → MUC" if c_other_airport else "? → MUC"
 
             connected.append({
-                "number_raw":         c_number_raw,
-                "airline_iata":       c_airline_iata,
-                "route":              route,
-                "sched_utc":          str(c_sched_utc),
-                "resolved_delay_min": resolved_delay,
-                "delay_source":       delay_source,
-                "delay_status":       status,
-                "is_propagated":      delay_source == "model_propagation",
+                "number_raw": safe_val(c_number_raw),
+                "airline_iata": safe_val(c_airline_iata),
+                "route": safe_val(route),
+                "sched_utc": safe_val(c_sched_utc),
+                "resolved_delay_min": safe_val(resolved_delay),
+                "delay_source": safe_val(delay_source),
+                "delay_status": safe_val(status),
+                "is_propagated": safe_val(delay_source == "model_propagation"),
             })
 
-        return {"connected_flights": connected}
+        return {"propagation": connected, "source": source_payload}
 
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error("/flights/propagation error: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.exception(
+            "Propagation error for number_raw=%s sched_utc=%s: %s",
+            number_raw,
+            sched_utc,
+            exc,
+        )
+        return {"propagation": [], "source": {}, "error": str(exc)}
 
 
 # NEW ENDPOINTS ADDED

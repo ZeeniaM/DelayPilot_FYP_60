@@ -210,7 +210,7 @@ def _run_full_refresh():
     _state["last_error"] = None
     cycle_start = datetime.now(timezone.utc)
     append_pipeline_log({
-        "event": "Cycle started",
+        "event": "Refresh cycle started",
         "status": "running",
         "timestamp": cycle_start.isoformat(),
     })
@@ -296,12 +296,12 @@ def _run_full_refresh():
     elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
     if _state["last_error"] is None:
         append_pipeline_log({
-            "event": "Cycle completed",
+            "event": "Refresh cycle completed",
             "status": "success",
             "timestamp": _now_iso(),
             "duration_seconds": round(elapsed, 1),
         })
-    _state["last_ran"] = cycle_start
+    _state["last_ran"] = datetime.now(timezone.utc)
     _state["running"]  = False
     logger.info("[background] ══ Full refresh cycle complete (%.1fs) ══", elapsed)
 
