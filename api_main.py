@@ -343,19 +343,65 @@ def predict_from_db(req: DbPredictionRequest):
             sched_dt.isoformat(),
         )
 
-        # Patch C — enrich with confirmed delay from flight_status_live
+        # Patch C — enrich with confirmed delay, falling back to flights_raw
         try:
             status_q = text("""
-                SELECT op_status, confirmed_delay_min, etd_utc, atd_utc, eta_utc, ata_utc
-                FROM flight_status_live
-                WHERE number_raw  = :number_raw
-                  AND flight_date = DATE(:sched_utc AT TIME ZONE 'UTC')
+                SELECT
+                    COALESCE(
+                        s.op_status,
+                        CASE r.status
+                            WHEN 'Landed'     THEN 'Landed'
+                            WHEN 'EnRoute'    THEN 'EnRoute'
+                            WHEN 'En Route'   THEN 'EnRoute'
+                            WHEN 'Departed'   THEN 'EnRoute'
+                            WHEN 'Cancelled'  THEN 'Cancelled'
+                            WHEN 'Diverted'   THEN 'Diverted'
+                            WHEN 'GateClosed' THEN 'EnRoute'
+                            WHEN 'Boarding'   THEN 'Scheduled'
+                            WHEN 'CheckIn'    THEN 'Scheduled'
+                            WHEN 'Delayed'    THEN 'Scheduled'
+                            WHEN 'Expected'   THEN 'Scheduled'
+                            ELSE NULL
+                        END,
+                        'Scheduled'
+                    ) AS op_status,
+                    COALESCE(
+                        s.confirmed_delay_min,
+                        CASE
+                            WHEN r.movement = 'departure' AND r.dep_best_utc IS NOT NULL
+                                THEN ROUND(
+                                    EXTRACT(EPOCH FROM (r.dep_best_utc - r.dep_sched_utc)) / 60.0
+                                , 1)
+                            WHEN r.movement = 'arrival' AND r.arr_best_utc IS NOT NULL
+                                THEN ROUND(
+                                    EXTRACT(EPOCH FROM (r.arr_best_utc - r.arr_sched_utc)) / 60.0
+                                , 1)
+                            ELSE NULL
+                        END
+                    ) AS confirmed_delay_min,
+                    COALESCE(s.etd_utc, r.dep_rev_utc)   AS etd_utc,
+                    COALESCE(s.atd_utc, r.dep_runway_utc) AS atd_utc,
+                    COALESCE(s.eta_utc, r.arr_rev_utc)   AS eta_utc,
+                    COALESCE(s.ata_utc, r.arr_runway_utc) AS ata_utc
+                FROM flights_raw r
+                LEFT JOIN flight_status_live s
+                       ON s.number_raw  = r.number_raw
+                      AND s.flight_date = DATE(
+                              COALESCE(r.dep_sched_utc, r.arr_sched_utc)
+                              AT TIME ZONE 'UTC'
+                          )
+                WHERE r.number_raw = :number_raw
+                  AND COALESCE(r.dep_sched_utc, r.arr_sched_utc) IS NOT NULL
+                ORDER BY
+                    ABS(EXTRACT(EPOCH FROM (
+                        COALESCE(r.dep_sched_utc, r.arr_sched_utc) - :sched_utc_ts
+                    ))) ASC
                 LIMIT 1
             """)
             with engine.connect() as conn:
                 srow = conn.execute(status_q, {
-                    "number_raw": req.number_raw,
-                    "sched_utc":  sched_dt,
+                    "number_raw":   req.number_raw,
+                    "sched_utc_ts": sched_dt,
                 }).fetchone()
 
             if srow:
@@ -368,6 +414,10 @@ def predict_from_db(req: DbPredictionRequest):
             else:
                 result["op_status"]           = "Scheduled"
                 result["confirmed_delay_min"] = None
+                result["etd_utc"]             = None
+                result["atd_utc"]             = None
+                result["eta_utc"]             = None
+                result["ata_utc"]             = None
         except Exception as status_exc:
             # Non-fatal — flight_status_live may not exist yet
             logger.warning("Could not fetch flight status for prediction: %s", status_exc)
@@ -661,13 +711,45 @@ def get_flights(date: str = None):
                     WHEN f.movement = 'departure' THEN r.dep_best_utc
                     ELSE r.arr_best_utc
                 END AS actual_utc,
-                -- Status from flight_status_live (authoritative)
-                COALESCE(s.op_status, 'Scheduled')  AS op_status,
+                -- Status: flight_status_live (authoritative) → FIDS r.status → 'Scheduled'
+                COALESCE(
+                    s.op_status,
+                    CASE r.status
+                        WHEN 'Landed'     THEN 'Landed'
+                        WHEN 'EnRoute'    THEN 'EnRoute'
+                        WHEN 'En Route'   THEN 'EnRoute'
+                        WHEN 'Departed'   THEN 'EnRoute'
+                        WHEN 'Cancelled'  THEN 'Cancelled'
+                        WHEN 'Diverted'   THEN 'Diverted'
+                        WHEN 'GateClosed' THEN 'EnRoute'
+                        WHEN 'Boarding'   THEN 'Scheduled'
+                        WHEN 'CheckIn'    THEN 'Scheduled'
+                        WHEN 'Delayed'    THEN 'Scheduled'
+                        WHEN 'Expected'   THEN 'Scheduled'
+                        WHEN 'Scheduled'  THEN 'Scheduled'
+                        ELSE NULL
+                    END,
+                    'Scheduled'
+                ) AS op_status,
                 s.etd_utc,
                 s.atd_utc,
                 s.eta_utc,
                 s.ata_utc,
-                s.confirmed_delay_min,
+                -- confirmed_delay_min: flight_status_live (Tier 1) → FIDS best times (Tier 2)
+                COALESCE(
+                    s.confirmed_delay_min,
+                    CASE
+                        WHEN f.movement = 'departure' AND r.dep_best_utc IS NOT NULL
+                            THEN ROUND(
+                                EXTRACT(EPOCH FROM (r.dep_best_utc - r.dep_sched_utc)) / 60.0
+                            , 1)
+                        WHEN f.movement = 'arrival' AND r.arr_best_utc IS NOT NULL
+                            THEN ROUND(
+                                EXTRACT(EPOCH FROM (r.arr_best_utc - r.arr_sched_utc)) / 60.0
+                            , 1)
+                        ELSE NULL
+                    END
+                ) AS confirmed_delay_min,
                 -- ML batch predictions (from flight_predictions, populated by run_batch_predictions.py)
                 p.minutes_ui            AS ml_minutes_ui,
                 p.p_delay_15            AS ml_p_delay_15,
